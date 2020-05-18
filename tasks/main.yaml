@@ -1,0 +1,111 @@
+---
+- name: Check if discovered distribution match with the inventory
+  assert:
+    that: '"archlinux" in group_names'
+    fail_msg: "Expected to {{ansible_distribution|lower}} to be in those groups: {{ group_names | join(' ') }}"
+    success_msg: "Distribution exists on host's groups"
+
+- name: Creating filesystem directories on target
+  file:
+    path: "{% if not ansible_local.bootstrapped | default(false) %}{{root_target}}{% endif %}{{ item[0] }}"
+    mode: "{{ item[1] }}"
+    state: directory
+  loop:
+    - [ /var/cache/pacman/pkg, "0755" ]
+    - [ /var/lib/pacman      , "0755" ]
+    - [ /var/log             , "0755" ]
+    - [ /dev                 , "0755" ]
+    - [ /run                 , "0755" ]
+    - [ /etc/pacman.d        , "0755" ]
+    - [ /tmp                 , "1777" ]
+    - [ /sys                 , "0555" ]
+    - [ /proc                , "0555" ]
+
+- name: Bootstrapping/Updating the system
+  block:
+  - name: Mounting filesystems
+    command:
+      warn: no
+      argv: [ "mount", "{{ item.src }}", "{{ item.path }}", "-t", "{{ item.fstype }}", "-o", "{{ item.opts }},x-mount.mkdir" ]
+    changed_when: no
+    loop: "{{ to_mount }}"
+
+  - name: Preparing chroot environment on not bootstrapped systems
+    command:
+      warn: no
+      argv: [ "mount", "{{ item.src }}", "{{ root_target + item.path }}", "-t", "{{ item.fstype }}", "-o", "{{ item.opts }},x-mount.mkdir" ]
+    changed_when: no
+    loop: "{{ chroot_mounts }}"
+    when: item.mount_switch and not ansible_local.bootstrapped | default(false)
+
+  - name: Preinstalling pacman on not bootstrapped systems
+    command: >
+      unshare --fork --pid
+      pacman --noconfirm --noprogressbar --sync --refresh
+        --root "{{ root_target }}"
+        pacman
+    when: not ansible_local.bootstrapped | default(false)
+
+  # Pacman ansible module install package by package so using command make things a lot faster.
+  - name: Installing packages marked as explicit
+    command: >
+      pacman --noconfirm --noprogressbar --sync
+      {% if pacman_sysupgrade or not ansible_local.bootstrapped | default(false) %}--refresh --sysupgrade {% endif %}
+      {% if not ansible_local.bootstrapped | default(false) %}--sysroot {{ root_target }} {% endif %}
+       --asexplicit --needed
+      {{ ansible_local.pacman.explicit | join(" ") }}
+    notify: Info about foreign packages (skipped if there is no foreign packages)
+    when: ansible_local.pacman.explicit | length > 0
+
+  # So we can install optional dependencies if we installed as deps as you should ;)
+  - name: Installing packages marked as dependencies
+    command: >
+      pacman --noconfirm --noprogressbar --sync
+      {% if not ansible_local.bootstrapped | default(false) %}--sysroot {{ root_target }} {% endif %}
+       --asdeps --needed
+      {{ ansible_local.pacman.dependencies | join(" ") }}
+    notify: Info about foreign packages (skipped if there is no foreign packages)
+    when: ansible_local.pacman.dependencies | length > 0
+
+  - name: Find snippets
+    find:
+      depth: 1
+      path: "{% if not ansible_local.bootstrapped | default(false) %}{{root_target}}{% endif %}{{ snippets }}"
+    register: snippets
+
+  - name: Execute all snippets
+    command: >
+      {% if ansible_local.bootstrapped | default(false) %}
+        bash {{ item.path }}
+      {% else %}
+        chroot {{root_target}} bash {{ item.path | regex_replace( "^" + root_target, "") }}
+      {% endif %}
+    when: item.xusr | bool
+    with_items: "{{ snippets.files }}"
+
+  - name: Setting up root user
+    command:
+      argv: >-
+        {% if ansible_local.bootstrapped | default(false) -%}
+          {{ [ "chpasswd" ] }}
+        {% else -%}
+          {{ [ "chpasswd", "-R", root_target ] }}
+        {% endif -%}
+      stdin: "root:{{ root_password }}"
+    when: root_password is defined and root_password | default("") | length > 0
+
+  always:
+  - name: Unmounting filesystems previously not mounted
+    command:
+      warn: no
+      argv: [ "umount", "{{ item.path }}" ]
+    changed_when: no
+    loop: "{{ to_mount[::-1] | default ([])}}"
+
+  - name: Unmounting chroot environment on not bootstrapped systems
+    command:
+      warn: no
+      argv: [ "umount", "-l", "{{ root_target + item.path }}" ]
+    changed_when: no
+    loop: "{{ chroot_mounts[::-1] }}"
+    when: item.mount_switch and not ansible_local.bootstrapped | default(false)
